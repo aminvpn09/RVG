@@ -261,6 +261,9 @@ def log_activity(kind: str, message: str, level: str = "info"):
 # ── Auth ──────────────────────────────────────────────────────────────────────
 SESSION_COOKIE = "rvg_session"
 SESSION_TTL = 60 * 60 * 24 * 7
+LOGIN_FAILURE_WINDOW = 15 * 60
+LOGIN_MAX_FAILURES = 8
+LOGIN_LOCKOUT_SECONDS = 15 * 60
 
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
@@ -268,6 +271,47 @@ def hash_password(pw: str) -> str:
 AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"))}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
+LOGIN_FAILURES: dict[str, tuple[int, float, float]] = {}
+LOGIN_FAILURES_LOCK = asyncio.Lock()
+
+
+async def login_is_locked(ip: str) -> bool:
+    """Return whether an IP is temporarily blocked after repeated failures."""
+    now = time.time()
+    async with LOGIN_FAILURES_LOCK:
+        failure = LOGIN_FAILURES.get(ip)
+        if failure is None:
+            return False
+        attempts, first_failure, locked_until = failure
+        if locked_until > now:
+            return True
+        if now - first_failure > LOGIN_FAILURE_WINDOW:
+            LOGIN_FAILURES.pop(ip, None)
+        return False
+
+
+async def record_login_failure(ip: str) -> None:
+    """Record a failed login without allowing the in-memory tracker to grow forever."""
+    now = time.time()
+    async with LOGIN_FAILURES_LOCK:
+        expired = [key for key, (_, first_failure, locked_until) in LOGIN_FAILURES.items()
+                   if locked_until <= now and now - first_failure > LOGIN_FAILURE_WINDOW]
+        for key in expired:
+            LOGIN_FAILURES.pop(key, None)
+
+        attempts, first_failure, locked_until = LOGIN_FAILURES.get(ip, (0, now, 0.0))
+        if now - first_failure > LOGIN_FAILURE_WINDOW:
+            attempts, first_failure, locked_until = 0, now, 0.0
+        attempts += 1
+        if attempts >= LOGIN_MAX_FAILURES:
+            locked_until = now + LOGIN_LOCKOUT_SECONDS
+        LOGIN_FAILURES[ip] = (attempts, first_failure, locked_until)
+
+
+async def clear_login_failures(ip: str) -> None:
+    async with LOGIN_FAILURES_LOCK:
+        LOGIN_FAILURES.pop(ip, None)
+
 
 async def create_session() -> str:
     token = secrets.token_urlsafe(32)
@@ -1045,13 +1089,28 @@ async def sub_group_subscription(uuid_key: str, request: Request):
 async def api_login(request: Request):
     body = await request.json()
     ip = client_ip(request)
-    if hash_password(str(body.get("password", ""))) != AUTH["password_hash"]:
+    if await login_is_locked(ip):
+        raise HTTPException(status_code=429, detail="تعداد تلاش‌های ورود بیش از حد مجاز است؛ چند دقیقه بعد دوباره تلاش کنید")
+
+    supplied_hash = hash_password(str(body.get("password", "")))
+    if not secrets.compare_digest(supplied_hash, AUTH["password_hash"]):
+        await record_login_failure(ip)
         log_activity("auth", f"تلاش ورود ناموفق از {ip}", "err")
         raise HTTPException(status_code=401, detail="رمز عبور اشتباه است")
+
+    await clear_login_failures(ip)
     token = await create_session()
     log_activity("auth", f"ورود موفق به پنل از {ip}", "ok")
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
+    resp.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_TTL,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+        path="/",
+    )
     return resp
 
 @app.post("/api/logout")
